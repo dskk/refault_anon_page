@@ -1,3 +1,5 @@
+#CFLAGS_REMOVE_refaulter.o += -fpatchable-function-entry
+OBJECT_FILES_NON_STANDARD := y
 obj-m := refaulter.o
 
 all:
