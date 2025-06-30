@@ -20,6 +20,11 @@ MODULE_LICENSE("GPL");
 
 #define DEVICE_NAME "refaulter"
 
+#define DEBUG_DUMP_PRINT(label, addr) \
+    pr_info(label ": %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n", \
+            (addr)[0], (addr)[1], (addr)[2], (addr)[3], (addr)[4], (addr)[5], (addr)[6], (addr)[7], \
+            (addr)[8], (addr)[9], (addr)[10], (addr)[11], (addr)[12], (addr)[13], (addr)[14], (addr)[15])
+
 // -------------------------------------------------------------------
 typedef void (*text_poke_funcptr_t)(void *addr, const void *opcode, size_t len);
 text_poke_funcptr_t text_poke_funcptr = NULL;
@@ -34,27 +39,25 @@ static unsigned long text_poke_address = 0;
 module_param(text_poke_address, ulong, 0644);
 MODULE_PARM_DESC(text_poke_address, "Virtual address of text_poke");
 
-static unsigned char overwrite_len = 0;
-module_param(overwrite_len, byte, 0644);
+static int overwrite_len = 0;
+module_param(overwrite_len, int, 0644);
 MODULE_PARM_DESC(overwrite_len, "Kernel func patch length");
 
 //static void* trampoline;
-static unsigned char __attribute__((section(".text"))) trampoline[255];
-static unsigned char orig_bytes[255];
-static unsigned char overwrite_bytes[255];
+__attribute__((section(".text#"))) static unsigned char trampoline[16 + JMP_INST_LEN];
+static unsigned char orig_bytes[16];
+static unsigned char overwrite_bytes[16];
 
 // -------------------------------------------------------------------
-
 static dev_t dev_num;         // <-- NEW: Dynamically allocated major/minor number
 static struct class *dev_class; // <-- NEW: Device class for sysfs
 static struct cdev cdev_instance; // <-- NEW: cdev structure for character device
 
 // -------------------------------------------------------------------
 // handle_pte_fault の代替処理
-
 static vm_fault_t __noreturn my_handle_pte_fault(struct vm_fault *vmf)
 {
-    pr_info("refaulter: Hooked handle_pte_fault for addr=0x%lx\n", vmf->address);
+    //pr_info("refaulter: Hooked handle_pte_fault for addr=0x%lx\n", vmf->address);
     asm volatile("jmp *%0" :: "r"(trampoline));
     unreachable();
 }
@@ -153,6 +156,11 @@ static int __init refaulter_init(void)
         return -EINVAL;
     }
 
+    if (overwrite_len >= 16 || overwrite_len < JMP_INST_LEN) {
+        pr_err("Error: overwrite_len . Aborting.\n");
+        return -EINVAL;
+    }
+
     text_poke_funcptr = (text_poke_funcptr_t)text_poke_address;
 
     // NEW: 動的にメジャー/マイナー番号を割り当てる
@@ -196,7 +204,7 @@ static int __init refaulter_init(void)
     pr_info("Device node /dev/%s created automatically\n", DEVICE_NAME);
 
     // install hook
-    pr_info("kernel func hook installing... (addr=0x%lx, len=%u)\n", target_hook_address, overwrite_len);
+    pr_info("kernel func hook installing... (addr=0x%lx, len=%d)\n", target_hook_address, overwrite_len);
 
     /*
     trampoline = __vmalloc_node_range(
@@ -218,23 +226,31 @@ static int __init refaulter_init(void)
     unsigned char* target_ptr = (unsigned char*)target_hook_address;
     int32_t jmp_offset;
 
+    DEBUG_DUMP_PRINT("target_func before overwrite", target_ptr);
+
     memcpy(orig_bytes, target_ptr, overwrite_len);
-    pr_info("target: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x", orig_bytes[0], orig_bytes[1], orig_bytes[2], orig_bytes[3], orig_bytes[4], orig_bytes[5], orig_bytes[6], orig_bytes[7], orig_bytes[8], orig_bytes[9], orig_bytes[10], orig_bytes[11], orig_bytes[12], orig_bytes[13], orig_bytes[14], orig_bytes[15]);
+
+    DEBUG_DUMP_PRINT("copied orig_bytes", target_ptr);
 
     text_poke_funcptr(trampoline, orig_bytes, overwrite_len);
-    trampoline[overwrite_len] = JMP_OPCODE;
+    unsigned char jmp_opcode = JMP_OPCODE;
+    text_poke_funcptr(&trampoline[overwrite_len], &jmp_opcode, sizeof(jmp_opcode));
     jmp_offset = (int32_t)(((int64_t)target_ptr + JMP_INST_LEN) - ((int64_t)&trampoline[overwrite_len] + JMP_INST_LEN));
     text_poke_funcptr(&trampoline[overwrite_len + 1], &jmp_offset, sizeof(jmp_offset));
+    pr_info("trampoline_addr %p\n", trampoline);
+    DEBUG_DUMP_PRINT("constructed trampoline", trampoline);
 
     overwrite_bytes[0] = JMP_OPCODE;
     jmp_offset = (int32_t)((int64_t)my_handle_pte_fault - ((int64_t)target_ptr + JMP_INST_LEN));
     memcpy(&overwrite_bytes[1], &jmp_offset, sizeof(jmp_offset));
     memset(&overwrite_bytes[JMP_INST_LEN], NOP_OPCODE, overwrite_len - JMP_INST_LEN);
-    //make_kernel_text_page_rw((void*)target_ptr);
-    text_poke_funcptr(target_ptr, overwrite_bytes, overwrite_len);
-    pr_info("target: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x", orig_bytes[0], orig_bytes[1], orig_bytes[2], orig_bytes[3], orig_bytes[4], orig_bytes[5], orig_bytes[6], orig_bytes[7], orig_bytes[8], orig_bytes[9], orig_bytes[10], orig_bytes[11], orig_bytes[12], orig_bytes[13], orig_bytes[14], orig_bytes[15]);
-    //clflush_cache_range(target_ptr, overwrite_len);
-    //make_kernel_text_page_ro((void*)target_ptr);
+    pr_info("my_handle_pte_fault addr %p\n", my_handle_pte_fault);
+    DEBUG_DUMP_PRINT("constructed overwrite_bytes", overwrite_bytes);
+    ////make_kernel_text_page_rw((void*)target_ptr);
+    text_poke_funcptr(target_ptr, overwrite_bytes, overwrite_len); // critical
+    DEBUG_DUMP_PRINT("target_func after overwrite", target_ptr);
+    ////clflush_cache_range(target_ptr, overwrite_len);
+    ////make_kernel_text_page_ro((void*)target_ptr);
 
     pr_info("kernel func hook installed. (addr=0x%lx, len=%u)\n", target_hook_address, overwrite_len);
 
@@ -249,6 +265,7 @@ static void __exit refaulter_exit(void)
 
     unsigned char* target_ptr = (unsigned char*)target_hook_address;
     text_poke_funcptr(target_ptr, orig_bytes, overwrite_len);
+    DEBUG_DUMP_PRINT("target_func after overwrite", target_ptr);
 
     /*
     make_kernel_text_page_rw((void*)target_ptr);
